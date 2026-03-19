@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 import os
 
 
@@ -24,3 +25,27 @@ print(decoded)
 assert s == decoded
 
 print("HELLO WORLD")
+
+torch.manual_seed(1337)
+batch_size = 4
+block_size = 8
+data = None
+
+n = int(0.9 * len(data))
+train_data = data[:n-6]
+val_data = data[n:]
+
+def get_batch(split):
+    if split == 'train':
+        data = train_data 
+    else:
+        data = val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([train_data[x:x+block_size] for x in ix])
+    y = torch.stack([train_data[x+1:x+block_size+1] for x in ix])
+    return x,y
+
+xb,yb = get_batch('train')
+print('inputs:',xb.shape,xb)
+print(xb)
+print(yb)
