@@ -6,7 +6,7 @@ import argparse
 from datetime import datetime
 import wandb  # type: ignore
 
-_WANDB_AVAILABLE = False
+_WANDB_AVAILABLE = True
 
 batch_size = 4
 block_size = 8
@@ -18,6 +18,8 @@ learning_rate = 1e-3
 n_embd = 32
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("device:", device)
+global_count = 0 
+
 
 def get_batch(data):
     ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -49,14 +51,16 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size,n_embd)
         self.position_embedding_table = nn.Embedding(block_size,n_embd)
         self.lm_head = nn.Linear(n_embd,vocab_size)
+        self.wei = nn.Parameter(torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self,idx,targets=None):
+        global global_count
         B,T = idx.shape
 
         #Let's add the average of all previous tokens as a simple context
-        wei = torch.tril(torch.ones(T,T)) # (T,T)
-        wei = wei / wei.sum(dim=1,keepdim=True)
-        wei = wei.to(idx.device)
+        #wei = torch.tril(torch.ones(T,T)) # (T,T)
+        #wei = wei / wei.sum(dim=1,keepdim=True)
+        #wei = wei.to(idx.device)
         #print("wei shape:", wei.shape)
 
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
@@ -66,6 +70,18 @@ class BigramLanguageModel(nn.Module):
 
         x = tok_emb + pos_emb # (B,T,C)
         #print("x shape after adding token and position embeddings:", x.shape)
+
+        # enforce causal mask (optional but safer)
+        wei = self.wei[:T, :T]
+        mask = torch.tril(torch.ones(T, T, device=x.device))
+        wei = wei.masked_fill(mask == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)  # normalize
+
+        if global_count % 1000 == 0:
+             print("wei shape after masking and softmax:", wei.shape)
+             print('intial wei:', wei)
+        global_count = global_count + 1
+
         x = x.transpose(1, 2)   # (4, 32, 8)
         x = x @ wei.T           # (4, 32, 8)
         x = x.transpose(1, 2)   # (4, 8, 32)
