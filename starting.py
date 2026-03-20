@@ -29,7 +29,7 @@ print("HELLO WORLD")
 torch.manual_seed(1337)
 batch_size = 4
 block_size = 8
-data = None
+data = torch.tensor(encode(text), dtype=torch.long)
 
 n = int(0.9 * len(data))
 train_data = data[:n-6]
