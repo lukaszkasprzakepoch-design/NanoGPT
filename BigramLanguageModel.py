@@ -4,21 +4,25 @@ import torch.nn.functional as F
 import tqdm
 import argparse
 from datetime import datetime
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import wandb  # type: ignore
 
 _WANDB_AVAILABLE = True
 
-batch_size = 4
-block_size = 8
-max_tokens = 1000
-max_iters = 10000
+batch_size = 64
+block_size = 256
+max_tokens = 5000
+max_iters = 3000
 eval_iters = 200
 eval_interval = 1000
-learning_rate = 1e-3
-n_embd = 32
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+learning_rate = 1e-4
+head_size = 32
+num_heads = 6
+n_embd = 384
+device = 'cuda' #'cuda' if torch.cuda.is_available() else 'cpu'
 print("device:", device)
 global_count = 0 
+dropout = 0.4  # Increased from 0.2 to reduce overfitting
 
 
 def get_batch(data):
@@ -45,23 +49,77 @@ def estimate_loss():
     m.train()
     return out
 
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self,x):
+        B,T,C = x.shape
+        k = self.key(x) # (B,T,head_size)
+        q = self.query(x) # (B,T,head_size)
+        v = self.value(x) # (B,T,head_size)
+
+        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B,T,T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B,T,T)
+        wei = F.softmax(wei, dim=-1) # (B,T,T)
+        wei = F.dropout(wei, p=dropout, training=self.training) # (B,T,T)
+
+        out = wei @ v # (B,T,head_size)
+        return out
+    
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(num_heads * head_size, n_embd)
+
+    def forward(self,x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
+
+class Block(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.sa_head = MultiHeadAttention(num_heads, head_size)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ffwd = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
+        )
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self,x):
+        x = x + self.sa_head(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
 class BigramLanguageModel(nn.Module):
     def __init__(self,vocab_size):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size,n_embd)
         self.position_embedding_table = nn.Embedding(block_size,n_embd)
+        self.blocks = nn.Sequential(
+            Block(num_heads=num_heads, head_size=head_size),
+            Block(num_heads=num_heads, head_size=head_size),
+            Block(num_heads=num_heads, head_size=head_size),
+            Block(num_heads=num_heads, head_size=head_size),
+            Block(num_heads=num_heads, head_size=head_size),
+            Block(num_heads=num_heads, head_size=head_size),
+            nn.LayerNorm(n_embd)
+        )
         self.lm_head = nn.Linear(n_embd,vocab_size)
-        self.wei = nn.Parameter(torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self,idx,targets=None):
         global global_count
         B,T = idx.shape
-
-        #Let's add the average of all previous tokens as a simple context
-        #wei = torch.tril(torch.ones(T,T)) # (T,T)
-        #wei = wei / wei.sum(dim=1,keepdim=True)
-        #wei = wei.to(idx.device)
-        #print("wei shape:", wei.shape)
+        
 
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         #print("tok_emb shape:", tok_emb.shape)
@@ -71,21 +129,27 @@ class BigramLanguageModel(nn.Module):
         x = tok_emb + pos_emb # (B,T,C)
         #print("x shape after adding token and position embeddings:", x.shape)
 
-        # enforce causal mask (optional but safer)
-        wei = self.wei[:T, :T]
-        mask = torch.tril(torch.ones(T, T, device=x.device))
-        wei = wei.masked_fill(mask == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)  # normalize
-
-        if global_count % 1000 == 0:
-             print("wei shape after masking and softmax:", wei.shape)
-             print('intial wei:', wei)
-        global_count = global_count + 1
-
-        x = x.transpose(1, 2)   # (4, 32, 8)
-        x = x @ wei.T           # (4, 32, 8)
-        x = x.transpose(1, 2)   # (4, 8, 32)
+        #Lets build a proper attention mechanism using the wei matrix as the attention weights
+        x = self.blocks(x)
         logits = self.lm_head(x) # (B,T,C)
+
+
+
+        # enforce causal mask (optional but safer)
+        # wei = self.tril[:T, :T]
+        # mask = torch.tril(torch.ones(T, T, device=x.device))
+        # wei = wei.masked_fill(mask == 0, float('-inf'))
+        # wei = F.softmax(wei, dim=-1)  # normalize
+
+        # if global_count % 1000 == 0:
+        #      print("wei shape after masking and softmax:", wei.shape)
+        #      print('intial wei:', wei)
+        # global_count = global_count + 1
+
+        # x = x.transpose(1, 2)   # (4, 32, 8)
+        # x = x @ wei.T           # (4, 32, 8)
+        # x = x.transpose(1, 2)   # (4, 8, 32)
+        # logits = self.lm_head(x) # (B,T,C)
         
         #print("logits shape:",logits.shape)
         #print("logits:",logits)
@@ -177,7 +241,12 @@ if __name__ == "__main__":
     # print(xb)
     # print((xb @ wei.T)) # (B,T,C)
 
-    optimizer = torch.optim.AdamW(m.parameters(),lr=1e-3)
+    optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=max_iters)
+    
+    best_val_loss = float('inf')
+    patience = 5000  # Stop if validation loss doesn't improve for this many steps
+    patience_counter = 0
 
     for steps in tqdm.tqdm(range(max_iters)):
         xb,yb = get_batch(train_data)
@@ -188,10 +257,11 @@ if __name__ == "__main__":
         #print("model parameters shape before backward:", [p.shape for p in m.parameters()])
         loss.backward()
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
         if use_wandb:
-            wandb.log({"train/loss": loss.item(), "iter": steps}, step=steps)
+            wandb.log({"train/loss": loss.item(), "train/lr": optimizer.param_groups[0]['lr'], "iter": steps}, step=steps)
 
         if steps % eval_interval == 0:
             eval_loss = estimate_loss()
@@ -201,6 +271,16 @@ if __name__ == "__main__":
                     {"eval/train_loss": float(eval_loss["train"]), "eval/val_loss": float(eval_loss["val"])},
                     step=steps,
                 )
+            
+            # Early stopping: check if validation loss improved
+            if eval_loss["val"] < best_val_loss:
+                best_val_loss = eval_loss["val"]
+                patience_counter = 0
+            else:
+                patience_counter += eval_interval
+                if patience_counter >= patience:
+                    print(f"Early stopping at step {steps}: validation loss hasn't improved in {patience} steps")
+                    break
     print(torch.zeros((1,1)))
     print(decode(m.generate(idx=torch.zeros((1,1),dtype=torch.long,device=device),max_new_tokens=max_tokens)[0].tolist()))
 
